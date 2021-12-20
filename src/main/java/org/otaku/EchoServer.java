@@ -1,62 +1,94 @@
 package org.otaku;
 
-import java.net.*;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
-import java.util.Objects;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
 
 public class EchoServer {
     //绑定端口号
     private static final int PORT = 80;
     //等待accept的队列长度
     private static final int BACKLOG = 4096;
+    private static final Map<SocketChannel, ByteBuffer> readBuffers = new HashMap<>();
 
     public static void main(String[] args) throws Exception {
-        ServerSocket ss = new ServerSocket();
-        //允许TIME_WAIT状态的端口被重用
-        ss.setReuseAddress(true);
-        //accept超时时间
-        ss.setSoTimeout(1000000);
-        //缓冲区大小
-        ss.setReceiveBufferSize(64000);
-        //先设置好option再绑定端口
-        ss.bind(new InetSocketAddress(PORT), BACKLOG);
-        System.out.printf("server bind at port %s%n", PORT);
+        //selector用于选择就绪的channel进行读写
+        Selector selector = Selector.open();
+        //channel就是读写数据的通道
+        ServerSocketChannel ssc = ServerSocketChannel.open();
+        ssc.configureBlocking(false);
+        ssc.bind(new InetSocketAddress(PORT), BACKLOG);
+        System.out.printf("server bind at %s%n", PORT);
+        //将自身注册到selector
+        ssc.register(selector, SelectionKey.OP_ACCEPT);
+        //selector开始select
         while (true) {
-            Socket s = ss.accept();
-            new Thread(new ClientHandler(s)).start();
+            //阻塞1秒
+            selector.select(1000);
+            //获取已就绪的事件进行处理
+            Set<SelectionKey> selectionKeys = selector.selectedKeys();
+            Iterator<SelectionKey> iter = selectionKeys.iterator();
+            while (iter.hasNext()) {
+                SelectionKey selectionKey = iter.next();
+                if (!selectionKey.isValid()) {
+                    System.out.printf("selectKey %s invalid", selectionKey);
+                    iter.remove();
+                    continue;
+                }
+                if (selectionKey.isAcceptable()) {
+                    handleAcceptable(selector, selectionKey);
+                }
+                if (selectionKey.isReadable()) {
+                    handleReadable(selectionKey);
+                }
+                //处理完移除SelectionKey
+                iter.remove();
+            }
         }
     }
 
-    public static class ClientHandler implements Runnable {
-        private final Socket s;
-
-        public ClientHandler(Socket s) {
-            this.s = Objects.requireNonNull(s);
+    private static void handleAcceptable(Selector selector, SelectionKey selectionKey) throws Exception {
+        ServerSocketChannel ssc = (ServerSocketChannel) selectionKey.channel();
+        SocketChannel sc = ssc.accept();
+        if (sc == null) {
+            return;
+        } else {
+            System.out.printf("accept %s%n", sc);
         }
+        sc.configureBlocking(false);
+        readBuffers.put(sc, ByteBuffer.allocate(512));
+        sc.register(selector, SelectionKey.OP_READ);
+        System.out.printf("register %s to selector%n", sc);
+    }
 
-        @Override
-        public void run() {
-            try {
-                //禁用nagle算法，该算法以固定时间间隔发生packet，可能导致不必要的延迟
-                s.setTcpNoDelay(true);
-                //对于客户端socket，SO_TIMEOUT设置read和write阻塞时间，仅blocking mode有用
-                s.setSoTimeout(10000);
-                //空闲时间超过2小时，自动发生TCP心跳包
-                s.setKeepAlive(true);
-                //读到EOF为止
-                byte[] receive = s.getInputStream().readAllBytes();
-                String receiveValue = new String(receive, StandardCharsets.UTF_8);
-                System.out.printf("receive from client: %s%n", receiveValue);
-                s.getOutputStream().write(receive);
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                try {
-                    s.close();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
+    private static void handleReadable(SelectionKey selectionKey) throws Exception {
+        SocketChannel sc = (SocketChannel) selectionKey.channel();
+        System.out.printf("channel %s readable%n", sc);
+        ByteBuffer readBuffer = readBuffers.get(sc);
+        //end of stream被认为是可读的，所以如果不cancel掉selectionKey，一直会被选中
+        int read = sc.read(readBuffer);
+        if (read == -1) {
+            readBuffer.flip();
+            byte[] data = new byte[readBuffer.remaining()];
+            readBuffer.get(data);
+            System.out.printf("from client: %s%n", new String(data, StandardCharsets.UTF_8));
+            readBuffer.flip();
+            //非阻塞写，直到写完所有字节为止，采用这种实现只是为了简单考虑，也可以追加到本地缓存，在writable事件中去写
+            //netty的实现就是追加到写队列，然后在每次eventLoop中，如果channel可写就尝试写
+            while (readBuffer.remaining() > 0) {
+                sc.write(readBuffer);
             }
+            selectionKey.cancel();
+            sc.close();
+            readBuffers.remove(sc);
         }
     }
 

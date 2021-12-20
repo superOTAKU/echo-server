@@ -11,6 +11,8 @@ public class EchoClient {
         socket.setKeepAlive(true);
         socket.connect(new InetSocketAddress(80), 15000);
         socket.getOutputStream().write("Hello".getBytes(StandardCharsets.UTF_8));
+        //等待5秒，观察nio selector事件
+        Thread.sleep(5000);
         //半关闭连接，表示数据发送完毕
         socket.shutdownOutput();
         //读到EOF为止
